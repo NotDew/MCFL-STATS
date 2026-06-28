@@ -87,6 +87,13 @@ def _tier_color(rank: int):
     return DEFAULT_RANK_COLOR
 
 
+AVERAGE_STAT_LABELS = {"QBR"}
+
+
+def _display_label(label: str) -> str:
+    return f"{label} (AVG)" if label in AVERAGE_STAT_LABELS else label
+
+
 def _format_total(value: float) -> str:
     if value == int(value):
         return str(int(value))
@@ -122,7 +129,7 @@ def render_stat_leaderboard_card(stat_label: str, ranked: List[Tuple[str, str, f
 
     draw.rectangle([0, 0, CARD_WIDTH, BANNER_HEIGHT], fill=COLOR_BANNER_BG)
     banner_font = _load_font(22, bold=True)
-    draw.text((CARD_WIDTH / 2, BANNER_HEIGHT / 2), stat_label.upper(),
+    draw.text((CARD_WIDTH / 2, BANNER_HEIGHT / 2), _display_label(stat_label).upper(),
                font=banner_font, fill=COLOR_BANNER_TEXT, anchor="mm")
 
     name_font = _load_font(17, bold=True)

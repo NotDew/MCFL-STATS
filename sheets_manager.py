@@ -66,6 +66,12 @@ CURATED_STATS = [
     "Swats", "Def TD",
 ]
 
+AVERAGE_STATS = {"QBR"}
+
+
+def _display_label(label: str) -> str:
+    return f"{label} (AVG)" if label in AVERAGE_STATS else label
+
 TOP_N = 5
 BLOCKS_PER_ROW = 3
 BLOCK_COLS = 3
@@ -175,12 +181,14 @@ class SheetsManager:
 
         for k, label in enumerate(stats):
             stat_idx = headers.index(label)
-            ranked = []
+            totals: Dict[str, float] = {}
+            counts: Dict[str, int] = {}
+            display_name: Dict[str, str] = {}
             for row in data_rows:
                 if week_filter is not None:
                     if len(row) <= week_idx or row[week_idx].strip() != str(week_filter):
                         continue
-                if len(row) <= stat_idx:
+                if len(row) <= max(stat_idx, player_idx):
                     continue
                 val_str = row[stat_idx].strip()
                 if val_str == "":
@@ -189,10 +197,17 @@ class SheetsManager:
                     val = float(val_str)
                 except ValueError:
                     continue
-                player = row[player_idx] if len(row) > player_idx else ""
-                ranked.append((player, val))
-            ranked.sort(key=lambda x: x[1], reverse=True)
-            ranked = ranked[:TOP_N]
+                player = row[player_idx].strip()
+                if not player:
+                    continue
+                key = player.lower()
+                display_name[key] = player
+                totals[key] = totals.get(key, 0.0) + val
+                counts[key] = counts.get(key, 0) + 1
+            if label in AVERAGE_STATS:
+                totals = {key: v / counts[key] for key, v in totals.items()}
+            ranked = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)[:TOP_N]
+            ranked = [(display_name[key], v) for key, v in ranked]
 
             title_row, start_col_idx0 = self._grid_position(k)
 
@@ -203,7 +218,7 @@ class SheetsManager:
                 return {"userEnteredValue": {"numberValue": v}}
 
             rows_data = [
-                {"values": [text_cell(label), text_cell("")]},
+                {"values": [text_cell(_display_label(label)), text_cell("")]},
                 {"values": [text_cell("Player"), text_cell("Value")]},
             ]
             for i in range(TOP_N):
@@ -588,7 +603,7 @@ class SheetsManager:
             self.refresh_leaderboards_for_week(old_week)
 
 
-    def update_single_stat(self, game_id: int, player: str, stat_label: str, value) -> bool:
+    def update_single_stat(self, game_id: int, player: str, stat_label: str, value: float, mode: str = "set") -> Tuple[bool, Optional[float]]:
         headers = self._ensure_columns([stat_label])
         col_idx = headers.index(stat_label) + 1
         week_idx = headers.index("Week")
@@ -599,12 +614,21 @@ class SheetsManager:
 
         for i, row in enumerate(all_values[1:], start=2):
             if row[gid_col].strip() == str(game_id) and row[player_col].strip().lower() == player.strip().lower():
-                self.sheet.update_cell(i, col_idx, value)
+                if mode == "add":
+                    current_str = row[col_idx - 1].strip() if len(row) >= col_idx else ""
+                    try:
+                        current = float(current_str) if current_str else 0.0
+                    except ValueError:
+                        current = 0.0
+                    new_value = current + value
+                else:
+                    new_value = value
+                self.sheet.update_cell(i, col_idx, new_value)
                 week = int(row[week_idx]) if row[week_idx].strip().isdigit() else None
                 if week is not None:
                     self.refresh_leaderboards_for_week(week)
-                return True
-        return False
+                return True, new_value
+        return False, None
 
     def find_players_in_game(self, game_id: int) -> List[str]:
         all_values = self.sheet.get_all_values()
@@ -653,6 +677,7 @@ class SheetsManager:
                 continue
             stat_idx = headers.index(label)
             totals_by_team: Dict[str, float] = {}
+            counts_by_team: Dict[str, int] = {}
             for row in data_rows:
                 if len(row) <= max(team_idx, stat_idx):
                     continue
@@ -667,8 +692,11 @@ class SheetsManager:
                 if not team:
                     continue
                 totals_by_team[team] = totals_by_team.get(team, 0.0) + val
+                counts_by_team[team] = counts_by_team.get(team, 0) + 1
             if not totals_by_team:
                 continue
+            if label in AVERAGE_STATS:
+                totals_by_team = {t: v / counts_by_team[t] for t, v in totals_by_team.items()}
             ranked = sorted(totals_by_team.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
             result[label] = ranked
         return result
@@ -684,6 +712,7 @@ class SheetsManager:
         stat_idx = headers.index(stat_label)
 
         totals: Dict[str, float] = {}
+        counts: Dict[str, int] = {}
         most_recent_team: Dict[str, str] = {}
         display_name: Dict[str, str] = {}
 
@@ -704,8 +733,12 @@ class SheetsManager:
             if val_str:
                 try:
                     totals[key] = totals.get(key, 0.0) + float(val_str)
+                    counts[key] = counts.get(key, 0) + 1
                 except ValueError:
                     pass
+
+        if stat_label in AVERAGE_STATS:
+            totals = {k: v / counts[k] for k, v in totals.items()}
 
         ranked = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
         return [(display_name[k], most_recent_team.get(k, ""), total) for k, total in ranked]
@@ -723,6 +756,7 @@ class SheetsManager:
                 continue
             stat_idx = headers.index(label)
             totals_by_team: Dict[str, float] = {}
+            counts_by_team: Dict[str, int] = {}
             for row in data_rows:
                 if len(row) <= max(team_idx, stat_idx):
                     continue
@@ -737,6 +771,10 @@ class SheetsManager:
                 if not team:
                     continue
                 totals_by_team[team] = totals_by_team.get(team, 0.0) + val
+                counts_by_team[team] = counts_by_team.get(team, 0) + 1
+
+            if label in AVERAGE_STATS:
+                totals_by_team = {t: v / counts_by_team[t] for t, v in totals_by_team.items()}
 
             match_key = next((t for t in totals_by_team if t.lower() == target), None)
             if match_key is None:
@@ -820,6 +858,48 @@ class SheetsManager:
             if len(row) > week_idx and row[week_idx].strip().isdigit()
         ]
         return max(weeks) if weeks else None
+
+    def get_global_player_leaderboard(self, stat_labels: List[str], top_n: int = 5) -> Dict[str, List[Tuple[str, str, float]]]:
+        headers = self._get_headers()
+        all_values = self.sheet.get_all_values()
+        data_rows = all_values[1:]
+        player_idx = headers.index("Player")
+        team_idx = headers.index("Team")
+
+        result: Dict[str, List[Tuple[str, str, float]]] = {}
+        for label in stat_labels:
+            if label not in headers:
+                continue
+            stat_idx = headers.index(label)
+            totals: Dict[str, float] = {}
+            counts: Dict[str, int] = {}
+            most_recent_team: Dict[str, str] = {}
+            display_name: Dict[str, str] = {}
+            for row in data_rows:
+                if len(row) <= max(player_idx, team_idx, stat_idx):
+                    continue
+                name = row[player_idx].strip()
+                if not name:
+                    continue
+                key = name.lower()
+                display_name[key] = name
+                team = row[team_idx].strip()
+                if team:
+                    most_recent_team[key] = team
+                val_str = row[stat_idx].strip()
+                if val_str:
+                    try:
+                        totals[key] = totals.get(key, 0.0) + float(val_str)
+                        counts[key] = counts.get(key, 0) + 1
+                    except ValueError:
+                        pass
+            if not totals:
+                continue
+            if label in AVERAGE_STATS:
+                totals = {k: v / counts[k] for k, v in totals.items()}
+            ranked = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
+            result[label] = [(display_name[k], most_recent_team.get(k, ""), total) for k, total in ranked]
+        return result
 
     def most_recent_game_id_for_player(self, player_name: str) -> Optional[int]:
         headers = self._get_headers()
@@ -954,6 +1034,7 @@ class SheetsManager:
             stat_idx = headers.index(label)
 
             totals_by_player: Dict[str, float] = {}
+            counts_by_player: Dict[str, int] = {}
             for row in data_rows:
                 if len(row) <= stat_idx or len(row) <= player_idx:
                     continue
@@ -966,6 +1047,10 @@ class SheetsManager:
                     continue
                 key = row[player_idx].strip().lower()
                 totals_by_player[key] = totals_by_player.get(key, 0.0) + val
+                counts_by_player[key] = counts_by_player.get(key, 0) + 1
+
+            if label in AVERAGE_STATS:
+                totals_by_player = {k: v / counts_by_player[k] for k, v in totals_by_player.items()}
 
             if target not in totals_by_player:
                 continue

@@ -4,7 +4,7 @@ import datetime
 import difflib
 import logging
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 import discord
 from discord import app_commands
@@ -17,6 +17,7 @@ from sheets_manager import SheetsManager, CURATED_STATS
 from player_card import render_player_card, ALL_CARD_STATS
 from team_stats_card import render_team_stats_card, render_single_team_card
 from leaderboard_card import render_stat_leaderboard_card
+from global_leaderboard_card import render_global_leaderboard_card
 import schedule
 
 load_dotenv()
@@ -441,21 +442,41 @@ async def leaderboard(interaction: discord.Interaction, stat: str):
     await interaction.followup.send(file=discord.File(buf, filename="leaderboard.png"))
 
 
+@bot.tree.command(name="globalleaderboard", description="Show an image with the top 5 players in every tracked stat")
+async def globalleaderboard(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+
+    player_leaderboard = sheets.get_global_player_leaderboard(CURATED_STATS, top_n=5)
+    if not player_leaderboard:
+        await interaction.followup.send("⚠️ No stats recorded yet.")
+        return
+
+    buf = render_global_leaderboard_card(player_leaderboard)
+    await interaction.followup.send(file=discord.File(buf, filename="global_leaderboard.png"))
+
+
 @bot.tree.command(name="updatestat", description="Fix a single stat for one player in a specific game")
 @app_commands.describe(
     game_id="The GameID shown when the game was logged",
     player="Player's in-game name (must match exactly as logged)",
     stat="Stat column name, e.g. 'FP', 'Rec YD', 'INT (D)'",
-    value="New numeric value",
+    value="The number to set or add",
+    mode="'set' replaces the current value, 'add' adds to whatever it currently is (default: set)",
 )
 @_is_referee()
-async def updatestat(interaction: discord.Interaction, game_id: int, player: str, stat: str, value: float):
+async def updatestat(interaction: discord.Interaction, game_id: int, player: str, stat: str, value: float, mode: Literal["set", "add"] = "set"):
     await interaction.response.defer(thinking=True, ephemeral=True)
-    found = sheets.update_single_stat(game_id, player, stat, value)
+    found, new_value = sheets.update_single_stat(game_id, player, stat, value, mode=mode)
     if found:
-        await interaction.followup.send(
-            f"✅ Updated **{stat}** to **{value}** for **{player}** in game #{game_id}.", ephemeral=True
-        )
+        if mode == "add":
+            await interaction.followup.send(
+                f"✅ Added **{value}** to **{stat}** for **{player}** in game #{game_id} -- new total: **{new_value}**.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                f"✅ Set **{stat}** to **{value}** for **{player}** in game #{game_id}.", ephemeral=True
+            )
     else:
         players = sheets.find_players_in_game(game_id)
         hint = f" Players found in that game: {', '.join(players)}" if players else " No rows found for that GameID at all."

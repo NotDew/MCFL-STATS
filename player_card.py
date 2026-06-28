@@ -111,6 +111,13 @@ def _tier_color(rank: int):
     return BLUE
 
 
+AVERAGE_STAT_LABELS = {"QBR"}
+
+
+def _display_label(label: str) -> str:
+    return f"{label} (AVG)" if label in AVERAGE_STAT_LABELS else label
+
+
 def _format_total(value: float) -> str:
     if value == int(value):
         return str(int(value))
@@ -271,7 +278,7 @@ def _draw_column(draw, x0: int, y0: int, body_height: int, title: str, header_co
         draw.rectangle([x0, y, x0 + COL_WIDTH, y + COL_ROW_HEIGHT], fill=row_bg)
         text_y = y + COL_ROW_HEIGHT // 2
 
-        draw.text((x0 + COL_PADDING, text_y), s["label"], font=label_font, fill=COLOR_LABEL_TEXT, anchor="lm")
+        draw.text((x0 + COL_PADDING, text_y), _display_label(s["label"]), font=label_font, fill=COLOR_LABEL_TEXT, anchor="lm")
 
         badge_color = _tier_color(s["rank"])
         badge_text = f"#{s['rank']}/{s['out_of']}"
@@ -352,7 +359,7 @@ def render_player_card(card_data: dict, avatar_bytes: Optional[bytes] = None) ->
     if hero:
         hero_color = _tier_color(hero["rank"])
         draw.rectangle([0, y, CARD_WIDTH, y + HERO_HEIGHT], fill=hero_color)
-        draw.text((PADDING, y + 16), hero["label"].upper(), font=label_font, fill=HERO_TEXT_ON_DARK)
+        draw.text((PADDING, y + 16), _display_label(hero["label"]).upper(), font=label_font, fill=HERO_TEXT_ON_DARK)
         draw.text((PADDING, y + 42), _format_total(hero["total"]), font=value_font_big, fill=HERO_TEXT_ON_DARK)
 
         rank_text = f"RANK #{hero['rank']}"
