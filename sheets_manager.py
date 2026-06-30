@@ -62,11 +62,11 @@ NUM_FIXED_COLUMNS = len(FIXED_COLUMNS)
 
 CURATED_STATS = [
     "FP", "QBR", "Passing YD", "Passing TD", "Rec YD", "Rec TD",
-    "Rushing YD", "Rushing TD", "Tackles", "Sacks", "INT (D)", "INT (O)",
+    "Rushing YD", "Rushing TD", "Tackles", "Sacks", "Sacks Allowed", "INT (D)", "INT (O)",
     "Swats", "Def TD",
 ]
 
-AVERAGE_STATS = {"QBR"}
+AVERAGE_STATS = {"QBR", "Pass Pct"}
 
 
 def _display_label(label: str) -> str:
@@ -121,6 +121,8 @@ class SheetsManager:
             self.sheet = self.spreadsheet.add_worksheet(title=master_sheet_name, rows=5000, cols=40)
             self.sheet.append_row(FIXED_COLUMNS)
 
+        self._migrate_renamed_headers()
+
         try:
             self.meta_sheet = self.spreadsheet.worksheet("_meta")
         except gspread.WorksheetNotFound:
@@ -142,6 +144,28 @@ class SheetsManager:
         self._style_master_sheet()
         self._organize_tabs()
 
+
+    HEADER_RENAMES = {"Sacks (O)": "Sacks Allowed"}
+
+    def _migrate_renamed_headers(self):
+        for old_name, new_name in self.HEADER_RENAMES.items():
+            headers = self._get_headers()
+            if old_name not in headers:
+                continue
+            old_idx = headers.index(old_name)
+
+            if new_name not in headers:
+                self.sheet.update_cell(1, old_idx + 1, new_name)
+                continue
+
+            new_idx = headers.index(new_name)
+            all_values = self.sheet.get_all_values()
+            for i, row in enumerate(all_values[1:], start=2):
+                old_val = row[old_idx].strip() if len(row) > old_idx else ""
+                new_val = row[new_idx].strip() if len(row) > new_idx else ""
+                if old_val and not new_val:
+                    self.sheet.update_cell(i, new_idx + 1, old_val)
+            self.sheet.update_cell(1, old_idx + 1, f"_deprecated_{old_name}")
 
     def _get_headers(self) -> List[str]:
         return self.sheet.row_values(1)
@@ -525,6 +549,18 @@ class SheetsManager:
                 return int(r["GameID"])
         return None
 
+    def get_message_game_pairs(self) -> List[Tuple[int, int]]:
+        records = self.meta_sheet.get_all_records()
+        pairs = []
+        for r in records:
+            mid, gid = r.get("MessageID"), r.get("GameID")
+            if mid and gid:
+                try:
+                    pairs.append((int(mid), int(gid)))
+                except ValueError:
+                    continue
+        return pairs
+
 
     def write_game(
         self,
@@ -544,9 +580,34 @@ class SheetsManager:
 
         self.ensure_week_sheet(week)
 
+        team_sacks_total: Dict[str, float] = {}
+        for team in game.teams:
+            total = 0.0
+            for p in team.players:
+                v = p.stats.get("Sacks")
+                if v is not None:
+                    try:
+                        total += float(v)
+                    except (TypeError, ValueError):
+                        pass
+            team_sacks_total[team.name.lower()] = total
+
         rows_to_append = []
         for team in game.teams:
             opponent = next((t for t in game.teams if t is not team), None)
+            opponent_sacks = team_sacks_total.get(opponent.name.lower(), 0.0) if opponent else 0.0
+            if not team.players:
+                row = {h: "" for h in headers}
+                row["GameID"] = game_id
+                row["Date"] = game_date.isoformat()
+                row["Week"] = week
+                row["Team"] = team.name
+                row["TeamScore"] = team.score
+                row["Opponent"] = opponent.name if opponent else ""
+                row["OppScore"] = opponent.score if opponent else ""
+                row["Player"] = f"(No Stats - {team.name})"
+                rows_to_append.append([row[h] for h in headers])
+                continue
             for p in team.players:
                 row = {h: "" for h in headers}
                 row["GameID"] = game_id
@@ -559,6 +620,12 @@ class SheetsManager:
                 row["Player"] = p.name
                 for label, value in p.stats.items():
                     row[label] = value
+                if "Sacks Allowed" in p.stats:
+                    try:
+                        existing = float(p.stats["Sacks Allowed"])
+                    except (TypeError, ValueError):
+                        existing = 0.0
+                    row["Sacks Allowed"] = existing + opponent_sacks
                 rows_to_append.append([row[h] for h in headers])
 
 
@@ -569,6 +636,284 @@ class SheetsManager:
             self.remember_message(message_id, game_id)
 
         return game_id
+
+    def add_forfeit(self, week: int, winner: str, loser: str, game_date: Optional[datetime.date] = None) -> int:
+        headers = self._get_headers()
+        game_date = game_date or datetime.date.today()
+        game_id = self.next_game_id()
+
+        self.ensure_week_sheet(week)
+
+        rows_to_append = []
+        for team, opp, team_score, opp_score in ((winner, loser, 1, 0), (loser, winner, 0, 1)):
+            row = {h: "" for h in headers}
+            row["GameID"] = game_id
+            row["Date"] = game_date.isoformat()
+            row["Week"] = week
+            row["Team"] = team
+            row["TeamScore"] = team_score
+            row["Opponent"] = opp
+            row["OppScore"] = opp_score
+            row["Player"] = "(Forfeit)"
+            rows_to_append.append([row[h] for h in headers])
+
+        self.sheet.append_rows(rows_to_append, value_input_option="RAW")
+        return game_id
+
+    def add_tie(self, week: int, team_a: str, team_b: str, game_date: Optional[datetime.date] = None) -> int:
+        headers = self._get_headers()
+        game_date = game_date or datetime.date.today()
+        game_id = self.next_game_id()
+
+        self.ensure_week_sheet(week)
+
+        rows_to_append = []
+        for team, opp in ((team_a, team_b), (team_b, team_a)):
+            row = {h: "" for h in headers}
+            row["GameID"] = game_id
+            row["Date"] = game_date.isoformat()
+            row["Week"] = week
+            row["Team"] = team
+            row["TeamScore"] = 0
+            row["Opponent"] = opp
+            row["OppScore"] = 0
+            row["Player"] = "(Forfeit Tie)"
+            rows_to_append.append([row[h] for h in headers])
+
+        self.sheet.append_rows(rows_to_append, value_input_option="RAW")
+        return game_id
+
+    def get_players_with_sacks_o_recorded(self) -> List[str]:
+        headers = self._get_headers()
+        if "Sacks Allowed" not in headers:
+            return []
+        all_values = self.sheet.get_all_values()
+        player_idx = headers.index("Player")
+        sacks_o_idx = headers.index("Sacks Allowed")
+        seen = {}
+        for row in all_values[1:]:
+            if len(row) <= max(player_idx, sacks_o_idx):
+                continue
+            if row[sacks_o_idx].strip() == "":
+                continue
+            name = row[player_idx].strip()
+            if name:
+                seen[name.lower()] = name
+        return list(seen.values())
+
+    def get_lineman_players(self) -> List[str]:
+        agg = self._aggregate_all_players(self.POSITION_DETECT_STATS)
+        names = []
+        for entry in agg.values():
+            if self._detect_primary_position(entry["sums"]) == "line":
+                names.append(entry["display"])
+        return names
+
+    def apply_sacks_allowed_from_opponent(self, player_name: str) -> List[dict]:
+        headers = self._ensure_columns(["Sacks Allowed"])
+        sacks_o_col = headers.index("Sacks Allowed") + 1
+        sacks_idx = headers.index("Sacks") if "Sacks" in headers else None
+        player_idx = headers.index("Player")
+        team_idx = headers.index("Team")
+        gid_idx = headers.index("GameID")
+        week_idx = headers.index("Week")
+
+        all_values = self.sheet.get_all_values()
+        data_rows = all_values[1:]
+        target = player_name.strip().lower()
+
+        player_rows = []
+        for i, row in enumerate(data_rows, start=2):
+            if len(row) > player_idx and row[player_idx].strip().lower() == target:
+                player_rows.append((i, row))
+
+        if not player_rows:
+            return []
+
+        results = []
+        weeks_touched = set()
+        for row_idx, row in player_rows:
+            gid = row[gid_idx].strip()
+            team = row[team_idx].strip()
+            if not gid:
+                continue
+
+            opponent_sacks_total = 0.0
+            for other_row in data_rows:
+                if len(other_row) <= max(gid_idx, team_idx):
+                    continue
+                if other_row[gid_idx].strip() != gid:
+                    continue
+                if other_row[team_idx].strip().lower() == team.lower():
+                    continue
+                if sacks_idx is not None and len(other_row) > sacks_idx:
+                    v = other_row[sacks_idx].strip()
+                    if v:
+                        try:
+                            opponent_sacks_total += float(v)
+                        except ValueError:
+                            pass
+
+            current_val = row[sacks_o_col - 1].strip() if len(row) >= sacks_o_col else ""
+            try:
+                current = float(current_val) if current_val else 0.0
+            except ValueError:
+                current = 0.0
+            new_val = current + opponent_sacks_total
+
+            self.sheet.update_cell(row_idx, sacks_o_col, new_val)
+            results.append({"game_id": gid, "opponent_sacks": opponent_sacks_total, "old_value": current, "new_value": new_val})
+
+            if len(row) > week_idx and row[week_idx].strip().isdigit():
+                weeks_touched.add(int(row[week_idx]))
+
+        for week in weeks_touched:
+            self.refresh_leaderboards_for_week(week)
+
+        return results
+
+    def add_missing_team_result(self, game_id: int, team: str) -> bool:
+        headers = self._get_headers()
+        all_values = self.sheet.get_all_values()
+        gid_idx = headers.index("GameID")
+        team_idx = headers.index("Team")
+        teamscore_idx = headers.index("TeamScore")
+        opp_idx = headers.index("Opponent")
+        oppscore_idx = headers.index("OppScore")
+        week_idx = headers.index("Week")
+        date_idx = headers.index("Date")
+
+        target = team.strip().lower()
+        opponent_row = None
+        for row in all_values[1:]:
+            if len(row) <= max(gid_idx, opp_idx, team_idx, teamscore_idx, oppscore_idx, week_idx, date_idx):
+                continue
+            if row[gid_idx].strip() != str(game_id):
+                continue
+            if row[opp_idx].strip().lower() == target:
+                opponent_row = row
+                break
+
+        if opponent_row is None:
+            return False
+
+        opp_team_name = opponent_row[team_idx].strip()
+        opp_team_score = opponent_row[teamscore_idx].strip()
+        our_score = opponent_row[oppscore_idx].strip()
+        week = opponent_row[week_idx].strip()
+        date = opponent_row[date_idx].strip()
+
+        row = {h: "" for h in headers}
+        row["GameID"] = game_id
+        row["Date"] = date
+        row["Week"] = week
+        row["Team"] = team
+        row["TeamScore"] = our_score
+        row["Opponent"] = opp_team_name
+        row["OppScore"] = opp_team_score
+        row["Player"] = f"(No Stats - {team})"
+
+        self.sheet.append_rows([[row[h] for h in headers]], value_input_option="RAW")
+        if week.isdigit():
+            self.refresh_leaderboards_for_week(int(week))
+        return True
+
+    def _aggregate_all_players(self, stat_labels: List[str]) -> Dict[str, dict]:
+        headers = self._get_headers()
+        all_values = self.sheet.get_all_values()
+        data_rows = all_values[1:]
+        player_idx = headers.index("Player")
+        team_idx = headers.index("Team")
+        stat_idxs = {label: headers.index(label) for label in stat_labels if label in headers}
+
+        agg: Dict[str, dict] = {}
+        for row in data_rows:
+            if len(row) <= player_idx:
+                continue
+            name = row[player_idx].strip()
+            if not name:
+                continue
+            key = name.lower()
+            entry = agg.setdefault(key, {"display": name, "team": "", "games": 0, "sums": {}, "counts": {}})
+            entry["display"] = name
+            if len(row) > team_idx and row[team_idx].strip():
+                entry["team"] = row[team_idx].strip()
+            entry["games"] += 1
+            for label, idx in stat_idxs.items():
+                if len(row) > idx:
+                    v = row[idx].strip()
+                    if v:
+                        try:
+                            val = float(v)
+                            entry["sums"][label] = entry["sums"].get(label, 0.0) + val
+                            entry["counts"][label] = entry["counts"].get(label, 0) + 1
+                        except ValueError:
+                            pass
+        return agg
+
+    POSITION_DETECT_STATS = ["Passing YD", "Rec YD", "Rushing YD", "Tackles", "Sacks", "INT (D)", "Swats", "Def TD", "Sacks Allowed"]
+
+    @staticmethod
+    def _detect_primary_position(sums: Dict[str, float]) -> Optional[str]:
+        passing_yd = sums.get("Passing YD", 0.0)
+        rec_yd = sums.get("Rec YD", 0.0)
+        rush_yd = sums.get("Rushing YD", 0.0)
+        defense_total = sum(sums.get(s, 0.0) for s in ("Tackles", "Sacks", "INT (D)", "Swats", "Def TD"))
+        sacks_o = sums.get("Sacks Allowed", 0.0)
+
+        if passing_yd > 0 and passing_yd >= rec_yd and passing_yd >= rush_yd:
+            return "qb"
+        if rec_yd > 0 or rush_yd > 0:
+            return "wr"
+        if defense_total > 0 or sacks_o > 0:
+            return "line"
+        return None
+
+    def get_position_power_rankings(self, position: str, top_n: int = 10) -> List[dict]:
+        if position == "qb":
+            stat_labels = ["QBR", "Passing TD", "Passing YD", "Pass Pct", "INT (O)"]
+        elif position == "wr":
+            stat_labels = ["Rec YD", "Rec TD", "Rec", "Rushing YD", "Rush"]
+        elif position == "line":
+            stat_labels = ["Sacks", "Tackles", "INT (D)", "Sacks Allowed"]
+        else:
+            raise ValueError(f"Unknown position: {position}")
+
+        all_needed = list(dict.fromkeys(stat_labels + self.POSITION_DETECT_STATS))
+        agg = self._aggregate_all_players(all_needed)
+        results = []
+        for entry in agg.values():
+            games = entry["games"] or 1
+            sums, counts = entry["sums"], entry["counts"]
+
+            if self._detect_primary_position(sums) != position:
+                continue
+
+            if position == "qb":
+                qbr_avg = sums.get("QBR", 0.0) / counts.get("QBR", 1) if counts.get("QBR") else 0.0
+                pass_td_pg = sums.get("Passing TD", 0.0) / games
+                pass_yd_pg = sums.get("Passing YD", 0.0) / games
+                comp_pct_avg = sums.get("Pass Pct", 0.0) / counts.get("Pass Pct", 1) if counts.get("Pass Pct") else 0.0
+                int_pg = sums.get("INT (O)", 0.0) / games
+                power = (0.40 * qbr_avg) + (5 * pass_td_pg) + (0.02 * pass_yd_pg) + (0.10 * comp_pct_avg) - (0.75 * int_pg)
+            elif position == "wr":
+                rypg = sums.get("Rec YD", 0.0) / games
+                rtdg = sums.get("Rec TD", 0.0) / games
+                rpg = sums.get("Rec", 0.0) / games
+                ruyg = sums.get("Rushing YD", 0.0) / games
+                ruag = sums.get("Rush", 0.0) / games
+                power = (0.45 * rypg) + (12 * rtdg) + (3 * rpg) + (0.25 * ruyg) + ruag
+            else:
+                sacks_pg = sums.get("Sacks", 0.0) / games
+                tackles_pg = sums.get("Tackles", 0.0) / games
+                int_pg = sums.get("INT (D)", 0.0) / games
+                sacksallowed_pg = sums.get("Sacks Allowed", 0.0) / games
+                power = (6 * sacks_pg) + (1.5 * tackles_pg) + (8 * int_pg) - (5 * sacksallowed_pg)
+
+            results.append({"player": entry["display"], "team": entry["team"], "power": power})
+
+        results.sort(key=lambda r: -r["power"])
+        return results[:top_n]
 
 
     def get_week_for_game(self, game_id: int) -> Optional[int]:
@@ -858,6 +1203,168 @@ class SheetsManager:
             if len(row) > week_idx and row[week_idx].strip().isdigit()
         ]
         return max(weeks) if weeks else None
+
+    def get_league_standings(self) -> List[dict]:
+        headers = self._get_headers()
+        all_values = self.sheet.get_all_values()
+        data_rows = all_values[1:]
+
+        gid_idx = headers.index("GameID")
+        team_idx = headers.index("Team")
+        teamscore_idx = headers.index("TeamScore")
+        opp_idx = headers.index("Opponent")
+        oppscore_idx = headers.index("OppScore")
+        yard_cols = [headers.index(l) for l in ("Passing YD", "Rec YD", "Rushing YD") if l in headers]
+        sacks_idx = headers.index("Sacks") if "Sacks" in headers else None
+        int_d_idx = headers.index("INT (D)") if "INT (D)" in headers else None
+        int_o_idx = headers.index("INT (O)") if "INT (O)" in headers else None
+
+        game_team_yards: Dict[Tuple[str, str], float] = {}
+        game_team_sacks: Dict[Tuple[str, str], float] = {}
+        game_team_int_d: Dict[Tuple[str, str], float] = {}
+        game_team_int_o: Dict[Tuple[str, str], float] = {}
+        game_team_info: Dict[Tuple[str, str], dict] = {}
+
+        def _sum_col(row, idx):
+            if idx is None or len(row) <= idx:
+                return 0.0
+            v = row[idx].strip()
+            if not v:
+                return 0.0
+            try:
+                return float(v)
+            except ValueError:
+                return 0.0
+
+        for row in data_rows:
+            if len(row) <= max(gid_idx, team_idx, teamscore_idx, opp_idx, oppscore_idx):
+                continue
+            gid = row[gid_idx].strip()
+            team = row[team_idx].strip()
+            if not gid or not team:
+                continue
+            key = (gid, team.lower())
+
+            yards = sum(_sum_col(row, yi) for yi in yard_cols)
+            game_team_yards[key] = game_team_yards.get(key, 0.0) + yards
+            game_team_sacks[key] = game_team_sacks.get(key, 0.0) + _sum_col(row, sacks_idx)
+            game_team_int_d[key] = game_team_int_d.get(key, 0.0) + _sum_col(row, int_d_idx)
+            game_team_int_o[key] = game_team_int_o.get(key, 0.0) + _sum_col(row, int_o_idx)
+
+            if key not in game_team_info:
+                try:
+                    team_score = float(row[teamscore_idx]) if row[teamscore_idx].strip() else 0.0
+                except ValueError:
+                    team_score = 0.0
+                try:
+                    opp_score = float(row[oppscore_idx]) if row[oppscore_idx].strip() else 0.0
+                except ValueError:
+                    opp_score = 0.0
+                game_team_info[key] = {
+                    "team": team,
+                    "opponent": row[opp_idx].strip(),
+                    "team_score": team_score,
+                    "opp_score": opp_score,
+                    "gid": gid,
+                }
+
+        teams: Dict[str, dict] = {}
+        for key, info in game_team_info.items():
+            gid, team_lower = key
+            opp_key = (gid, info["opponent"].strip().lower())
+            opp_yards = game_team_yards.get(opp_key, 0.0)
+            team_yards = game_team_yards.get(key, 0.0)
+            opp_sacks = game_team_sacks.get(opp_key, 0.0)
+
+            t = teams.setdefault(team_lower, {
+                "team": info["team"], "gp": 0, "w": 0, "l": 0, "t": 0,
+                "pf": 0.0, "pa": 0.0, "yards_for": 0.0, "yards_against": 0.0,
+                "sacks_for": 0.0, "sacks_against": 0.0, "int_gained": 0.0, "int_thrown": 0.0,
+            })
+            t["gp"] += 1
+            t["pf"] += info["team_score"]
+            t["pa"] += info["opp_score"]
+            t["yards_for"] += team_yards
+            t["yards_against"] += opp_yards
+            t["sacks_for"] += game_team_sacks.get(key, 0.0)
+            t["sacks_against"] += opp_sacks
+            t["int_gained"] += game_team_int_d.get(key, 0.0)
+            t["int_thrown"] += game_team_int_o.get(key, 0.0)
+            if info["team_score"] > info["opp_score"]:
+                t["w"] += 1
+            elif info["team_score"] < info["opp_score"]:
+                t["l"] += 1
+            else:
+                t["t"] += 1
+
+        standings = []
+        for t in teams.values():
+            gp = t["gp"] or 1
+            win_pct = (t["w"] + 0.5 * t["t"]) / gp
+            standings.append({
+                "team": t["team"],
+                "gp": t["gp"], "w": t["w"], "l": t["l"], "t": t["t"],
+                "win_pct": win_pct,
+                "pf": t["pf"], "pa": t["pa"], "diff": t["pf"] - t["pa"],
+                "ppg": t["pf"] / gp, "papg": t["pa"] / gp,
+                "yards_for_pg": t["yards_for"] / gp,
+                "yards_against_pg": t["yards_against"] / gp,
+                "sacks_for_pg": t["sacks_for"] / gp,
+                "sacks_against_pg": t["sacks_against"] / gp,
+                "int_gained_pg": t["int_gained"] / gp,
+                "int_thrown_pg": t["int_thrown"] / gp,
+            })
+
+        standings.sort(key=lambda s: (-s["win_pct"], -s["diff"]))
+        return standings
+
+    @staticmethod
+    def compute_power_rankings(standings: List[dict]) -> List[dict]:
+        if not standings:
+            return []
+
+        diffs_pg = [s["diff"] / s["gp"] if s["gp"] else 0.0 for s in standings]
+        yards_for = [s["yards_for_pg"] for s in standings]
+        yards_against = [s["yards_against_pg"] for s in standings]
+        sacks_for = [s.get("sacks_for_pg", 0.0) for s in standings]
+        sacks_against = [s.get("sacks_against_pg", 0.0) for s in standings]
+        int_gained = [s.get("int_gained_pg", 0.0) for s in standings]
+        int_thrown = [s.get("int_thrown_pg", 0.0) for s in standings]
+
+        def norm(vals, val, invert=False):
+            lo, hi = min(vals), max(vals)
+            if hi == lo:
+                n = 0.5
+            else:
+                n = (val - lo) / (hi - lo)
+            return 1 - n if invert else n
+
+        results = []
+        for i, s in enumerate(standings):
+            win_component = s["win_pct"]
+            diff_component = norm(diffs_pg, diffs_pg[i])
+            yfor_component = norm(yards_for, yards_for[i])
+            yagainst_component = norm(yards_against, yards_against[i], invert=True)
+            sacksfor_component = norm(sacks_for, sacks_for[i])
+            sacksagainst_component = norm(sacks_against, sacks_against[i], invert=True)
+            intgained_component = norm(int_gained, int_gained[i])
+            intthrown_component = norm(int_thrown, int_thrown[i], invert=True)
+
+            power = 100 * (
+                0.30 * win_component
+                + 0.25 * diff_component
+                + 0.10 * yfor_component
+                + 0.10 * yagainst_component
+                + 0.08 * sacksfor_component
+                + 0.07 * sacksagainst_component
+                + 0.05 * intgained_component
+                + 0.05 * intthrown_component
+            )
+            power = max(1.0, min(100.0, power))
+            results.append({**s, "power": power})
+
+        results.sort(key=lambda r: -r["power"])
+        return results
 
     def get_global_player_leaderboard(self, stat_labels: List[str], top_n: int = 5) -> Dict[str, List[Tuple[str, str, float]]]:
         headers = self._get_headers()

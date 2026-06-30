@@ -18,6 +18,7 @@ from player_card import render_player_card, ALL_CARD_STATS
 from team_stats_card import render_team_stats_card, render_single_team_card
 from leaderboard_card import render_stat_leaderboard_card
 from global_leaderboard_card import render_global_leaderboard_card
+from league_card import render_league_card
 import schedule
 
 load_dotenv()
@@ -226,6 +227,20 @@ def build_recap_embed(game, game_id: int, week: int, title: str) -> discord.Embe
     for team in game.teams:
         names = ", ".join(p.name for p in team.players)
         embed.add_field(name=f"{team.name} ({team.score})", value=names or "no players parsed", inline=False)
+
+    unparsed_lines = []
+    for team in game.teams:
+        for p in team.players:
+            if p.unparsed:
+                unparsed_lines.append(f"**{p.name}**: {', '.join(p.unparsed)}")
+    if unparsed_lines:
+        embed.color = discord.Color.orange()
+        embed.add_field(
+            name="⚠️ Some stats couldn't be read and were NOT saved",
+            value="\n".join(unparsed_lines)[:1000],
+            inline=False,
+        )
+
     return embed
 
 
@@ -272,6 +287,22 @@ async def on_ready():
         synced = await bot.tree.sync()
         log.info(f"Synced {len(synced)} commands globally (can take up to ~1hr to appear)")
     log.info(f"Logged in as {bot.user}")
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    original = getattr(error, "original", error)
+    command_name = interaction.command.name if interaction.command else "?"
+    log.error(f"Command '{command_name}' failed: {type(original).__name__}: {original}")
+
+    message = "⚠️ Something went wrong running that command -- please try again."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except Exception:
+        pass
 
 
 @bot.event
@@ -453,6 +484,197 @@ async def globalleaderboard(interaction: discord.Interaction):
 
     buf = render_global_leaderboard_card(player_leaderboard)
     await interaction.followup.send(file=discord.File(buf, filename="global_leaderboard.png"))
+
+
+@bot.tree.command(name="league", description="Show league standings and power rankings for every team")
+async def league(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+
+    standings = sheets.get_league_standings()
+    if not standings:
+        await interaction.followup.send("⚠️ No games logged yet.")
+        return
+
+    power_rankings = SheetsManager.compute_power_rankings(standings)
+    buf = render_league_card(standings, power_rankings)
+    await interaction.followup.send(file=discord.File(buf, filename="league.png"))
+
+
+@bot.tree.command(name="ffw", description="Record a forfeit win for a team in a given week, so standings reflect it")
+@app_commands.describe(
+    week="Week number the forfeit happened in",
+    winner="Team that gets the win",
+    loser="Team that forfeited",
+)
+@app_commands.autocomplete(winner=team_autocomplete, loser=team_autocomplete)
+@_is_referee()
+async def ffw(interaction: discord.Interaction, week: int, winner: str, loser: str):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    matched_winner = next((t for t in schedule.all_teams() if t.lower() == winner.strip().lower()), None)
+    matched_loser = next((t for t in schedule.all_teams() if t.lower() == loser.strip().lower()), None)
+
+    if matched_winner is None or matched_loser is None:
+        bad = winner if matched_winner is None else loser
+        suggestions = difflib.get_close_matches(bad, schedule.all_teams(), n=3, cutoff=0.5)
+        hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+        await interaction.followup.send(f"⚠️ I don't recognize the team **{bad}**.{hint}", ephemeral=True)
+        return
+
+    if matched_winner.lower() == matched_loser.lower():
+        await interaction.followup.send("⚠️ Winner and loser can't be the same team.", ephemeral=True)
+        return
+
+    note = ""
+    scheduled_week = schedule.find_week(matched_winner, matched_loser)
+    if scheduled_week is not None and scheduled_week != week:
+        note = f"\n(Note: the schedule lists {matched_winner} vs {matched_loser} as Week {scheduled_week}, not Week {week} -- logged anyway.)"
+
+    game_id = sheets.add_forfeit(week, matched_winner, matched_loser)
+    await interaction.followup.send(
+        f"✅ Logged a forfeit win for **{matched_winner}** over **{matched_loser}** in Week {week} (game #{game_id}).{note}",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="tie", description="Record a forfeit tie between two teams in a given week, so standings reflect it")
+@app_commands.describe(
+    week="Week number the forfeit happened in",
+    team_a="First team",
+    team_b="Second team",
+)
+@app_commands.autocomplete(team_a=team_autocomplete, team_b=team_autocomplete)
+@_is_referee()
+async def tie(interaction: discord.Interaction, week: int, team_a: str, team_b: str):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    matched_a = next((t for t in schedule.all_teams() if t.lower() == team_a.strip().lower()), None)
+    matched_b = next((t for t in schedule.all_teams() if t.lower() == team_b.strip().lower()), None)
+
+    if matched_a is None or matched_b is None:
+        bad = team_a if matched_a is None else team_b
+        suggestions = difflib.get_close_matches(bad, schedule.all_teams(), n=3, cutoff=0.5)
+        hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+        await interaction.followup.send(f"⚠️ I don't recognize the team **{bad}**.{hint}", ephemeral=True)
+        return
+
+    if matched_a.lower() == matched_b.lower():
+        await interaction.followup.send("⚠️ The two teams can't be the same.", ephemeral=True)
+        return
+
+    note = ""
+    scheduled_week = schedule.find_week(matched_a, matched_b)
+    if scheduled_week is not None and scheduled_week != week:
+        note = f"\n(Note: the schedule lists {matched_a} vs {matched_b} as Week {scheduled_week}, not Week {week} -- logged anyway.)"
+
+    game_id = sheets.add_tie(week, matched_a, matched_b)
+    await interaction.followup.send(
+        f"✅ Logged a forfeit tie between **{matched_a}** and **{matched_b}** in Week {week} (game #{game_id}).{note}",
+        ephemeral=True,
+    )
+
+
+POWER_TITLES = {"qb": "QB POWER", "wr": "WR POWER", "line": "LINEMAN RATING"}
+
+
+@bot.tree.command(name="power", description="Show the top 10 power-ranked players at a position")
+@app_commands.describe(pos="Position to rank")
+async def power(interaction: discord.Interaction, pos: Literal["qb", "wr", "line"]):
+    await interaction.response.defer(thinking=True)
+
+    ranked = sheets.get_position_power_rankings(pos, top_n=10)
+    if not ranked:
+        await interaction.followup.send(f"⚠️ No {pos.upper()} stats recorded yet.")
+        return
+
+    rows = [(r["player"], r["team"], r["power"]) for r in ranked]
+    buf = render_stat_leaderboard_card(POWER_TITLES[pos], rows)
+    await interaction.followup.send(file=discord.File(buf, filename=f"power_{pos}.png"))
+
+
+@bot.tree.command(name="fixmissingteam", description="Restore a team's result in a game where they ended up with zero rows (e.g. an all-sub game)")
+@app_commands.describe(
+    game_id="The GameID the team is missing from",
+    team="The team whose result needs restoring",
+)
+@app_commands.autocomplete(team=team_autocomplete)
+@_is_referee()
+async def fixmissingteam(interaction: discord.Interaction, game_id: int, team: str):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    matched = next((t for t in schedule.all_teams() if t.lower() == team.strip().lower()), None)
+    if matched is None:
+        suggestions = difflib.get_close_matches(team, schedule.all_teams(), n=3, cutoff=0.5)
+        hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+        await interaction.followup.send(f"⚠️ I don't recognize the team **{team}**.{hint}", ephemeral=True)
+        return
+
+    ok = sheets.add_missing_team_result(game_id, matched)
+    if ok:
+        await interaction.followup.send(
+            f"✅ Restored **{matched}**'s result for game #{game_id}, pulled from their opponent's row.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.followup.send(
+            f"⚠️ Couldn't find a row in game #{game_id} listing **{matched}** as the opponent. "
+            f"Double check the GameID -- this only works if the *other* team's row for that game still exists.",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(name="fixsacksallowed", description="For a two-way lineman, add the opponent's total Sacks per game to his Sacks Allowed total")
+@app_commands.describe(player="Player's in-game name (must match exactly as logged)")
+@_is_referee()
+async def fixsacksallowed(interaction: discord.Interaction, player: str):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    results = sheets.apply_sacks_allowed_from_opponent(player)
+    if not results:
+        await interaction.followup.send(f"⚠️ No games found for **{player}**.", ephemeral=True)
+        return
+
+    lines = [f"✅ Updated **Sacks Allowed** for **{player}** across {len(results)} game(s):"]
+    for r in results:
+        lines.append(f"Game #{r['game_id']}: +{r['opponent_sacks']:g} (opponent's sacks that game) -> {r['old_value']:g} → {r['new_value']:g}")
+    text = "\n".join(lines)
+    if len(text) > 1900:
+        text = text[:1900] + "\n... (truncated)"
+    await interaction.followup.send(text, ephemeral=True)
+
+
+@bot.tree.command(name="fixsacksallowedall", description="One-time backfill: adds opponent sacks to every player's Sacks Allowed total")
+@_is_referee()
+async def fixsacksallowedall(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    players = sheets.get_lineman_players()
+    if not players:
+        await interaction.followup.send("⚠️ No players detected as linemen yet (need recorded Tackles/Sacks/INT (D)/etc).", ephemeral=True)
+        return
+
+    total_games_updated = 0
+    per_player_summary = []
+    for player in players:
+        results = sheets.apply_sacks_allowed_from_opponent(player)
+        if results:
+            total_games_updated += len(results)
+            per_player_summary.append(f"{player}: {len(results)} game(s)")
+        await asyncio.sleep(1.1)
+
+    lines = [f"✅ Backfilled **Sacks Allowed** for **{len(per_player_summary)}** player(s) across **{total_games_updated}** game row(s):"]
+    lines.extend(per_player_summary[:30])
+    if len(per_player_summary) > 30:
+        lines.append(f"...and {len(per_player_summary) - 30} more.")
+    lines.append(
+        "\n⚠️ Going forward, new games posted with a `Sacks Allowed` value already factor the opponent's sacks in "
+        "automatically -- only run this again if you need to re-backfill, since running it twice on the same "
+        "games will double-count."
+    )
+    text = "\n".join(lines)
+    if len(text) > 1900:
+        text = text[:1900] + "\n... (truncated)"
+    await interaction.followup.send(text, ephemeral=True)
 
 
 @bot.tree.command(name="updatestat", description="Fix a single stat for one player in a specific game")

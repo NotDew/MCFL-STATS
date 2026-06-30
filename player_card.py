@@ -3,6 +3,8 @@ from typing import List, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
+from team_logos import get_team_logo
+
 CARD_WIDTH = 700
 CORNER_RADIUS = 22
 MARGIN = 30
@@ -111,7 +113,7 @@ def _tier_color(rank: int):
     return BLUE
 
 
-AVERAGE_STAT_LABELS = {"QBR"}
+AVERAGE_STAT_LABELS = {"QBR", "Pass Pct"}
 
 
 def _display_label(label: str) -> str:
@@ -132,9 +134,10 @@ SECONDARY_OFFENSE_THRESHOLD = 50
 QB_STATS = ["QBR", "Pass Comp", "Pass Att", "Pass Pct", "Passing YD", "Passing TD", "INT (O)", "Rush", "Rushing YD", "Rushing TD"]
 SKILL_STATS = ["Rec", "Rec YD", "Rec TD", "Rush", "Rushing YD", "Rushing TD"]
 DEFENSE_STATS = ["Tackles", "Sacks", "INT (D)", "Swats", "Def TD"]
+OL_STATS = ["Sacks Allowed"]
 
 
-ALL_CARD_STATS = list(dict.fromkeys(["FP"] + QB_STATS + SKILL_STATS + DEFENSE_STATS))
+ALL_CARD_STATS = list(dict.fromkeys(["FP"] + QB_STATS + SKILL_STATS + DEFENSE_STATS + OL_STATS))
 
 POSITION_LABELS = {id(QB_STATS): "QB", id(SKILL_STATS): "WR"}
 
@@ -191,6 +194,13 @@ def _build_stat_layout(stats: List[dict]) -> Tuple[Optional[dict], List[tuple], 
         defense_list.append(by_label[label])
         seen.add(label)
 
+    ol_rows = [by_label[label] for label in OL_STATS if label not in seen and label in by_label]
+    if ol_rows:
+        offense_specs.append(("header", "OFFENSIVE LINE"))
+        for s in ol_rows:
+            offense_specs.append(("stat", s))
+            seen.add(s["label"])
+
     leftover = [s for s in stats if s["label"] not in seen and s["rank"] <= HIGH_RANK_THRESHOLD]
     leftover.sort(key=lambda s: (s["rank"], -s["out_of"]))
     extra_offense = [s for s in leftover[:MAX_EXTRA_STATS] if s["label"] in QB_STATS or s["label"] in SKILL_STATS]
@@ -203,7 +213,7 @@ def _build_stat_layout(stats: List[dict]) -> Tuple[Optional[dict], List[tuple], 
 
     if offense_group is not None:
         position_label = POSITION_LABELS[id(offense_group)]
-    elif defense_list:
+    elif defense_list or ol_rows:
         position_label = "Lineman"
     else:
         position_label = None
@@ -345,8 +355,16 @@ def render_player_card(card_data: dict, avatar_bytes: Optional[bytes] = None) ->
     draw.text((text_x, 38), card_data["name"], font=name_font, fill=header_text_color)
     n = card_data["games_played"]
     games_line = f"{n} game{'s' if n != 1 else ''} played"
+
+    sub_y = 78
+    sub_x = text_x
+    logo = get_team_logo(team, 20) if team else None
+    if logo is not None:
+        content.paste(logo, (int(sub_x), int(sub_y - 10)), logo)
+        sub_x += 26
+
     subtitle = f"{team}   •   {games_line}" if team else games_line
-    draw.text((text_x, 78), subtitle, font=sub_font, fill=header_subtext_color)
+    draw.text((sub_x, sub_y), subtitle, font=sub_font, fill=header_subtext_color)
 
     y = HEADER_HEIGHT
 

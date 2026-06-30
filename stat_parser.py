@@ -4,8 +4,8 @@ from typing import Dict, List
 
 
 RE_BARE_COMP_PCT = re.compile(r"^(\d+)\s*/\s*(\d+)\s*\((\d+)%\)$")
-RE_LABEL_FRACTION = re.compile(r"^([A-Za-z0-9]+)\s*:\s*(\d+)\s*/\s*(\d+)$")
-RE_LABEL_NUMBER = re.compile(r"^([A-Za-z0-9 ]+?)\s*:\s*(-?\d+(?:\.\d+)?)$")
+RE_LABEL_FRACTION = re.compile(r"^([A-Za-z0-9 ()]+?)\s*:\s*(\d+)\s*/\s*(\d+)$")
+RE_LABEL_NUMBER = re.compile(r"^([A-Za-z0-9 ()]+?)\s*:\s*(-?\d+(?:\.\d+)?)$")
 RE_NUMBER_LABEL = re.compile(r"^(-?\d+(?:\.\d+)?)\s+(.+)$")
 
 
